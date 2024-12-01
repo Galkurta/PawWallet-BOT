@@ -58,12 +58,6 @@ The bot will:
 - Process available missions
 - Track leaderboard position
 
-## Configuration
-
-- Default refresh interval: 1 hour
-- Mining claim threshold: 95% of bag capacity
-- Heart purchase threshold: < 3 hearts
-
 ## Dependencies
 
 - axios: HTTP client
