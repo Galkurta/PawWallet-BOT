@@ -34,6 +34,7 @@ const GAME_CONSTANTS = {
   CLAIM_THRESHOLD: 0.95, // 95% of bag capacity
   RETRY_DELAY: 300000, // 5 minutes in milliseconds
   MIN_HEARTS: 3,
+  ACCOUNT_SWITCH_DELAY: 3000,
 };
 
 class GameAutomation {
@@ -243,16 +244,27 @@ class GameAutomation {
       }
       return response.data;
     } catch (error) {
-      if (error.response?.data?.message === "UPGRADE_IN_PROGRESS") {
-        logger.info(
-          "Upgrade already in progress, continuing with current state"
-        );
-        return await this.getGameState();
+      if (error.response) {
+        switch (error.response.status) {
+          case 400:
+            logger.info("Upgrade not available at this time, continuing...");
+            return await this.getGameState();
+          case 500:
+            logger.warn("Server error during upgrade, will retry later");
+            return await this.getGameState();
+          default:
+            if (error.response?.data?.message === "UPGRADE_IN_PROGRESS") {
+              logger.info(
+                "Upgrade already in progress, continuing with current state"
+              );
+              return await this.getGameState();
+            }
+        }
       }
       logger.error(
         `Upgrade player failed: ${colors.error}${error.message}${colors.reset}`
       );
-      throw error;
+      return await this.getGameState();
     }
   }
 
@@ -290,16 +302,15 @@ class GameAutomation {
       return;
     }
 
-    const hasReferrals = await this.checkReferral();
-
     for (const mission of missionsResponse.data) {
       if (!mission || !mission.id || !mission.status) {
         logger.warn(`Invalid mission data: ${JSON.stringify(mission)}`);
         continue;
       }
 
-      if (mission.id === 6 && !hasReferrals) {
-        logger.warn("Skipping invite friends mission - no referrals found");
+      // Skip mission ID 6 (invite friends mission)
+      if (mission.id === 6) {
+        logger.info("Skipping invite friends mission");
         continue;
       }
 
@@ -458,52 +469,20 @@ class GameAutomation {
       const gameState = await this.getGameState();
       const player = gameState.data.player;
 
-      // Calculate time needed to fill the bag
+      // Calculate gold info but don't wait
       const currentTime = new Date();
       const lastAccumulateTime = new Date(player.lastAccumulateTime);
       const miningSpeed = player.miningSpeed;
       const bagCap = player.bagCap;
 
-      // Calculate current unclaimed gold
       const elapsedSeconds = (currentTime - lastAccumulateTime) / 1000;
       const currentGold = elapsedSeconds * miningSpeed + player.unclaimedGold;
-      const remainingCapacity = bagCap - currentGold;
-      const timeUntilFull = Math.max(
-        Math.ceil(remainingCapacity / miningSpeed),
-        1
-      );
 
       logger.info(
         `Current gold: ${colors.custom}${currentGold.toFixed(
           2
         )}/${bagCap} RCAT${colors.reset}`
       );
-      logger.info(
-        `Mining for: ${colors.timerCount}${Math.floor(
-          timeUntilFull / 60
-        )} minutes${colors.reset}`
-      );
-
-      await new Promise((resolve) => {
-        const endTime = Date.now() + timeUntilFull * 1000;
-        process.stdout.write(`Mining time remaining: ${colors.timerCount}`);
-
-        const interval = setInterval(() => {
-          const remaining = Math.ceil((endTime - Date.now()) / 1000);
-          if (remaining <= 0) {
-            process.stdout.write("\n");
-            clearInterval(interval);
-            resolve();
-          } else {
-            const minutes = Math.floor(remaining / 60);
-            const seconds = remaining % 60;
-            process.stdout.cursorTo(23);
-            process.stdout.write(
-              `${minutes}:${seconds.toString().padStart(2, "0")}${colors.reset}`
-            );
-          }
-        }, 1000);
-      });
 
       // Claim and finish cycle
       await this.claimGold();
@@ -517,33 +496,91 @@ class GameAutomation {
   }
 }
 
-async function startGlobalLoop() {
-  try {
-    printBanner();
+class MultiAccountManager {
+  constructor() {
+    this.accounts = [];
+    this.currentIndex = 0;
+  }
 
-    logger.info("Reading account data...");
-    const auth = fs.readFileSync("data.txt", "utf8").trim();
-    const automation = new GameAutomation(auth);
+  loadAccounts() {
+    try {
+      // Read accounts from data.txt
+      const accountData = fs.readFileSync("data.txt", "utf8");
+      this.accounts = accountData
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0);
 
-    while (true) {
-      try {
-        await automation.runAutomation();
-      } catch (error) {
-        logger.error(
-          `Mining cycle failed: ${colors.error}${error.message}${colors.reset}`
-        );
-        logger.warn("Retrying in 5 minutes...");
-        await new Promise((resolve) =>
-          setTimeout(resolve, GAME_CONSTANTS.RETRY_DELAY)
-        );
+      if (this.accounts.length === 0) {
+        throw new Error("No accounts found in data.txt");
       }
+
+      logger.success(`Loaded ${this.accounts.length} accounts successfully`);
+      return true;
+    } catch (error) {
+      logger.error(
+        `Failed to load accounts: ${colors.error}${error.message}${colors.reset}`
+      );
+      return false;
     }
-  } catch (error) {
-    logger.error(
-      `Main execution failed: ${colors.error}${error.message}${colors.reset}`
-    );
-    if (error.stack) {
-      logger.error(`Stack trace: ${colors.error}${error.stack}${colors.reset}`);
+  }
+
+  async processAllAccounts() {
+    while (true) {
+      for (let i = 0; i < this.accounts.length; i++) {
+        const auth = this.accounts[i];
+        logger.info(`Processing account ${i + 1}/${this.accounts.length}`);
+
+        const automation = new GameAutomation(auth);
+
+        try {
+          await automation.runAutomation();
+        } catch (error) {
+          logger.error(
+            `Error processing account ${i + 1}: ${colors.error}${
+              error.message
+            }${colors.reset}`
+          );
+        }
+
+        // Add delay between account switches if not the last account
+        if (i < this.accounts.length - 1) {
+          logger.info(
+            `Waiting ${
+              GAME_CONSTANTS.ACCOUNT_SWITCH_DELAY / 1000
+            } seconds before next account...`
+          );
+          await new Promise((resolve) =>
+            setTimeout(resolve, GAME_CONSTANTS.ACCOUNT_SWITCH_DELAY)
+          );
+        }
+      }
+
+      logger.info(
+        "All accounts processed. Starting countdown for next cycle..."
+      );
+
+      // Show countdown for next cycle
+      await new Promise((resolve) => {
+        const endTime = Date.now() + GAME_CONSTANTS.RETRY_DELAY;
+        process.stdout.write(`Next cycle in: ${colors.timerCount}`);
+
+        const interval = setInterval(() => {
+          const remaining = Math.ceil((endTime - Date.now()) / 1000);
+          if (remaining <= 0) {
+            process.stdout.write("\n");
+            clearInterval(interval);
+            resolve();
+          } else {
+            const minutes = Math.floor(remaining / 60);
+            const seconds = remaining % 60;
+            process.stdout.cursorTo(15);
+            process.stdout.write(
+              `${minutes}:${seconds.toString().padStart(2, "0")}${colors.reset}`
+            );
+          }
+        }, 1000);
+      });
     }
   }
 }
@@ -551,7 +588,20 @@ async function startGlobalLoop() {
 async function main() {
   while (true) {
     try {
-      await startGlobalLoop();
+      printBanner();
+
+      const manager = new MultiAccountManager();
+      if (!manager.loadAccounts()) {
+        logger.error(
+          "Failed to initialize account manager. Retrying in 5 minutes..."
+        );
+        await new Promise((resolve) =>
+          setTimeout(resolve, GAME_CONSTANTS.RETRY_DELAY)
+        );
+        continue;
+      }
+
+      await manager.processAllAccounts();
     } catch (error) {
       logger.error(
         `Critical error in main loop: ${colors.error}${error.message}${colors.reset}`
